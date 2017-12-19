@@ -11,28 +11,35 @@
    (threads :initform nil)
    (jobs :initform nil :initarg :jobs)
    (job-mutex :initform nil :initarg :job-mutex)
-   (job-cv :initform nil :initarg :job-cv)))
+   (job-cv :initform nil :initarg :job-cv)
+   (finish-mutex :initform nil :initarg :finish-mutex)
+   (finish-cv :initform nil :initarg :finish-cv)))
 
 (defun worker-thread (wq)
   (bt:make-thread
    (lambda ()
-     (let ((current-job nil)
-           (work-done nil))
-       (loop until work-done
-          do
-            (bt:condition-wait (slot-value wq 'job-cv) (slot-value wq 'job-mutex))
-            (unwind-protect
-                 (with-slots (jobs finished) wq
-                   (when jobs
-                     (setf current-job (pop jobs)))
-                   (when (and (null current-job) (null jobs) finished)
-                     (setf work-done t)))
-              (bt:release-lock (slot-value wq 'job-mutex)))
-            (when current-job
-              (with-slots (consumer-function) wq
-                (funcall consumer-function current-job))
-              (setf current-job nil)))))))
-           
+
+     (with-slots (jobs finished finish-mutex finish-cv job-mutex job-cv consumer-function) wq
+       (let ((current-job nil)
+             (work-done nil))
+
+         (loop until work-done
+            while (bt:with-lock-held (job-mutex)
+                    (format t "waiting on jobs.~%")
+                    jobs)
+            do
+              (cond ((bt:with-lock-held (job-mutex) (format t "waiting on jobs.~%") jobs)
+                     (bt:with-lock-held (job-mutex)
+                       (format t "waiting on jobs.~%")
+                       (when jobs
+                         (setf current-job (pop jobs)))))
+                    (current-job
+                     (funcall consumer-function current-job))
+                    ((bt:with-lock-held (job-mutex)
+                       (format t "waiting on finished.~%")finished)
+                     (setf work-done t))
+                    (t
+                     (bt:condition-wait job-cv job-mutex)))))))))
 
 
 (defun create-work-queue (consumer &optional (thread-count 8))
@@ -40,6 +47,8 @@
                            :thread-count thread-count
                            :job-mutex (bt:make-lock "job-queue-lock")
                            :job-cv (bt:make-condition-variable :name "job-cv")
+                           :finish-mutex (bt:make-lock "finish-queue-lock")
+                           :finish-cv (bt:make-condition-variable :name "finish-cv")
                            :consumer consumer)))
     (with-slots (threads jobs) wq
       (dotimes (i thread-count)
@@ -47,26 +56,24 @@
     wq))
 
 (defun add-job (wq item)
-  (when (slot-value wq 'finished)
-    (error "Work queue is already finished."))
-  (bt:acquire-lock (slot-value wq 'job-mutex))
-  (unwind-protect 
-       (with-slots (job-cv jobs) wq
-         (push item jobs))
-    (bt:release-lock (slot-value wq 'job-mutex)))
-  (bt:condition-notify (slot-value wq 'job-cv))
-  wq)
+  (with-slots (finished job-mutex job-cv jobs) wq
+    
+    (bt:with-lock-held (job-mutex)
+      (when finished
+        (error "Work queue is already finished."))
+      (bt:condition-notify (slot-value wq 'job-cv)))))
 
 (defun destroy-work-queue (wq)
-  (bt:acquire-lock (slot-value wq 'job-mutex))
-  (unwind-protect 
-       (with-slots (job-cv finished) wq
-         (setf finished t)
-         (bt:condition-notify job-cv))
-    (bt:release-lock (slot-value wq 'job-mutex)))
-  (dolist (thread (slot-value wq 'threads))
-    (bt:join-thread thread))
-  wq)
+  (with-slots (job-cv job-mutex finished finished-mutex finished-cv threads) wq
+    (dotimes (i (length threads))
+      (bt:with-lock-held (job-mutex)
+        (setf finished t)
+        (bt:condition-notify job-cv))
+      (bt:with-lock-held (finished-mutex)
+        (bt:condition-wait finished-mutex finished-cv)))
+    (dolist (thread threads)
+      (bt:join-thread thread))
+    wq))
 
 (defun stop-work-queue (wq)
   wq)
