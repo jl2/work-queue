@@ -9,6 +9,5 @@
            #:create-work-queue
            #:add-job
            #:destroy-work-queue
-           #:worker-queue
-           ))
+           #:worker-queue))
 

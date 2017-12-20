@@ -13,68 +13,69 @@
    (job-mutex :initform nil :initarg :job-mutex)
    (job-cv :initform nil :initarg :job-cv)
    (finish-mutex :initform nil :initarg :finish-mutex)
-   (finish-cv :initform nil :initarg :finish-cv)))
+   (finish-cv :initform nil :initarg :finish-cv))
+  (:documentation "A multi-threaded job queue."))
 
-(defun worker-thread (wq)
+(defun create-worker-thread (wq)
+  "Create a worker thread that waits for jobs and calls consumer-function with them."
   (bt:make-thread
    (lambda ()
-
      (with-slots (jobs finished finish-mutex finish-cv job-mutex job-cv consumer-function) wq
+
        (let ((current-job nil)
              (work-done nil))
 
          (loop until work-done
-            while (bt:with-lock-held (job-mutex)
-                    (format t "waiting on jobs.~%")
-                    jobs)
             do
-              (cond ((bt:with-lock-held (job-mutex) (format t "waiting on jobs.~%") jobs)
-                     (bt:with-lock-held (job-mutex)
-                       (format t "waiting on jobs.~%")
-                       (when jobs
-                         (setf current-job (pop jobs)))))
-                    (current-job
-                     (funcall consumer-function current-job))
-                    ((bt:with-lock-held (job-mutex)
-                       (format t "waiting on finished.~%")finished)
-                     (setf work-done t))
-                    (t
-                     (bt:condition-wait job-cv job-mutex)))))))))
+              (when current-job
+                (funcall consumer-function current-job)
+                (setf current-job nil))
+
+              (bt:with-lock-held (job-mutex)
+                (cond (jobs
+                       (setf current-job (pop jobs))
+                       (setf work-done nil))
+                      (finished
+                       (setf work-done t))
+                      (t
+                       (bt:condition-wait job-cv job-mutex))))))
+
+       (bt:condition-notify finish-cv)))))
 
 
 (defun create-work-queue (consumer &optional (thread-count 8))
+  "Create a work queue object and launch the specified number of threads."
   (let ((wq (make-instance 'work-queue
                            :thread-count thread-count
-                           :job-mutex (bt:make-lock "job-queue-lock")
-                           :job-cv (bt:make-condition-variable :name "job-cv")
-                           :finish-mutex (bt:make-lock "finish-queue-lock")
-                           :finish-cv (bt:make-condition-variable :name "finish-cv")
+                           :job-mutex (bt:make-lock)
+                           :job-cv (bt:make-condition-variable)
+                           :finish-mutex (bt:make-lock)
+                           :finish-cv (bt:make-condition-variable)
                            :consumer consumer)))
     (with-slots (threads jobs) wq
       (dotimes (i thread-count)
-        (push (worker-thread wq) threads)))
+        (push (create-worker-thread wq) threads)))
     wq))
 
 (defun add-job (wq item)
+  "Add a job to the work queue."
   (with-slots (finished job-mutex job-cv jobs) wq
-    
     (bt:with-lock-held (job-mutex)
       (when finished
         (error "Work queue is already finished."))
-      (bt:condition-notify (slot-value wq 'job-cv)))))
+      (push item jobs))
+    (bt:condition-notify job-cv)))
 
 (defun destroy-work-queue (wq)
-  (with-slots (job-cv job-mutex finished finished-mutex finished-cv threads) wq
+  "Wait for all jobs to finish and join all the threads."
+  (with-slots (job-cv job-mutex finished finish-mutex finish-cv threads) wq
     (dotimes (i (length threads))
       (bt:with-lock-held (job-mutex)
         (setf finished t)
         (bt:condition-notify job-cv))
-      (bt:with-lock-held (finished-mutex)
-        (bt:condition-wait finished-mutex finished-cv)))
+      (bt:with-lock-held (finish-mutex)
+        (bt:condition-wait finish-cv finish-mutex)))
     (dolist (thread threads)
       (bt:join-thread thread))
     wq))
 
-(defun stop-work-queue (wq)
-  wq)
-        
