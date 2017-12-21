@@ -39,8 +39,10 @@
                        (setf work-done t))
                       (t
                        (bt:condition-wait job-cv job-mutex))))))
-
-       (bt:condition-notify finish-cv)))))
+       (format t "Thread notifiying finish-cv.~%")
+       (bt:with-lock-held (finish-mutex)
+         (bt:condition-notify finish-cv)))
+       (format t "quitting ~%"))))
 
 
 (defun create-work-queue (consumer &optional (thread-count 8))
@@ -69,12 +71,10 @@
 (defun destroy-work-queue (wq)
   "Wait for all jobs to finish and join all the threads."
   (with-slots (job-cv job-mutex finished finish-mutex finish-cv threads) wq
+    (bt:with-lock-held (finish-mutex)
+      (setf finished t))
     (dotimes (i (length threads))
-      (bt:with-lock-held (job-mutex)
-        (setf finished t)
-        (bt:condition-notify job-cv))
-      (bt:with-lock-held (finish-mutex)
-        (bt:condition-wait finish-cv finish-mutex)))
+      (bt:condition-notify job-cv))
     (dolist (thread threads)
       (bt:join-thread thread))
     wq))
